@@ -14,17 +14,18 @@ input clk,
 input rst_n,
 input flush,
 
-// TLB core signals
+// TLB core signals, from CPU (assuming CPU holds the request until TLB response is ready with Physical_Page_ID_valid_out asserted)
 input [PAGE_ID_WIDTH-1:0] Virtual_Page_ID_in,
 input Virtual_Page_ID_valid_in, // Asserted if either read or write request is active
-input access_write_in,          // 1 if it is a write operation, 0 if read
+input req_type_in,          // 1 if it is a write operation, 0 if read
 
+// TLB output to MMU (to Cache and CPU)
 output [PAGE_ID_WIDTH-1:0] Physical_Page_ID_out,
-output Physical_Page_ID_valid_out,
-output Physical_Page_ID_Miss_out,
+output Physical_Page_ID_valid_out, // to CPU, so CPU can proceed to next request
+output Physical_Page_ID_Miss_out,  // PPN not found in TLB, trigger PTW to fetch the page table entry from memory and fill the TLB
 output Dirty_Fault_out,         // Asserted when a write hits a clean page (needs PTW to set dirty bit in memory)
 
-// TLB Fill Interface (from Page Table Walker / CPU)
+// TLB Fill Interface (from PTW)
 input fill_en,
 input [PAGE_ID_WIDTH-1:0] fill_virtual_page,
 input [PAGE_ID_WIDTH-1:0] fill_physical_page,
@@ -55,7 +56,7 @@ always_comb begin
     if(Virtual_Page_ID_valid_in) begin
         for(int i=0;i < TLB_SIZE;i = i+1) begin
             if(Virtual_Page_ID_in == TLB_Entries[i].Virtual_Page_ID && TLB_Entries[i].valid) begin
-                if (access_write_in && !TLB_Entries[i].dirty) begin
+                if (req_type_in && !TLB_Entries[i].dirty) begin
                     TLB_Dirty_Fault_flag = 1'b1; // Page is present but clean; write requires a fault to update PTE
                     TLB_Dirty_Fault_index = i;
                 end else begin
@@ -96,7 +97,7 @@ always @(posedge clk || negedge rst_n) begin
         end
         
         if(Virtual_Page_ID_valid_in) begin
-            if(TLB_Dirty_Fault_flag == 1'b1) begin
+            if(TLB_Dirty_Fault_flag == 1'b1) begin // Dirty fault takes priority over miss, so OS won't discard the page memory space and assign to other processes (silently corrupted when Cache write back)
                 Dirty_Fault_out <= 1'b1;
                 Physical_Page_ID_Miss_out <= 1'b0;
                 Physical_Page_ID_valid_out <= 1'b0;

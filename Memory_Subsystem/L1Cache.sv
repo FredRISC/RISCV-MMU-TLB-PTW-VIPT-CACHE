@@ -32,24 +32,25 @@ input flush,
 input TLB_stall_in, // if TLB is not ready with the physical page number, stall the cache access
 input fence_in, // for simplicity, we can assume fence will drain the MSHR and Store buffer and stall new requests until it's done
 
+// Core input signals
+input [XLEN-1:0] virtual_address_in, // Provides Virtual Index & Offset
+input [TAG_BITS-1:0] physical_tag_in, // From MMU/TLB (arrives at least 1 cycle later)
+input physical_tag_valid_in,          
+input [$clog2(LSQ_SIZE)-1:0] lsq_tag_in, // To be stored in MSHR target list and returned with data for retirement
+
 // Load interface
-input read_req_in,
+input load_req_in,
 input load_byte_en_in,
-output read_port_stall_out, // stall
-output [XLEN-1:0] read_data_out,
-output read_data_valid_out,
+output load_port_stall_out, // stall
+output [XLEN-1:0] load_data_out,
+output load_data_valid_out,
+output lsq_wakeup_vector_out[LSQ_SIZE-1:0], // wake up the corresponding lsq entry in the same order as target list
 
 // Store interface
-input write_req_in,
-input [XLEN-1:0] write_data_in,
+input store_req_in,
+input [XLEN-1:0] store_data_in,
 input [3:0] store_byte_en_in, 
-output write_port_stall_out, // stall
-
-// General input signals
-input [XLEN-1:0] virtual_address_in, // Provides Virtual Index & Offset
-input [TAG_BITS-1:0] physical_tag_in, // From MMU/TLB (arrives 1 cycle later in real pipeline)
-input physical_tag_valid_in,          // Asserts when TLB translation is complete
-input [$clog2(LSQ_SIZE)-1:0] lsq_tag_in, // Used if missed in Cache
+output store_port_stall_out, // stall
 
 // L2 interface
 output [BLOCK_ID_SIZE-1:0] L2_req_block_id_out, 
@@ -84,7 +85,6 @@ assign extracted_offset = virtual_address_in[0 +: OFFSET_BITS];
 
 logic [BLOCK_ID_SIZE-1:0] extracted_block_id;
 assign extracted_block_id = {extracted_tag, extracted_index};
-logic Cache_hit;
 
 // MSHR struct
 typedef struct packed {
@@ -100,8 +100,8 @@ MSHR_t MSHR_inst [MSHR_SIZE-1:0];
 typedef struct packed {
     logic valid;
     logic [BLOCK_ID_SIZE-1:0] block_id;
-    logic [7:0][CacheLineSize-1:0] store_data; // Coalesced
-    logic [CacheLineSize-1:0] write_byte_en;
+    logic [7:0][CacheLineSize-1:0] store_data; // Coalesced write data
+    logic [CacheLineSize-1:0] store_byte_en; // Coalesced byte enable for the whole cache line
 } Store_Buffer_t;
 
 Store_Buffer_t Store_Buffer_inst [MSHR_SIZE-1:0];
@@ -113,7 +113,7 @@ logic [$clog2(MSHR_SIZE)-1:0] MSHR_hit_ID;
 // MSHR Signals for Allocation 
 logic [$clog2(MSHR_SIZE)-1:0] MSHR_alloc_ID; // the allocated MSHR ID
 logic MSHR_AVAILABLE; // no MSHR available
-// Cache Block Return logic
+// L2 Cache Block Return logic
 logic [TAG_BITS-1:0] L2_return_tag;
 logic [INDEX_BITS-1:0] L2_return_index;
 assign L2_return_tag = L2_return_block_id_in[(BLOCK_ID_SIZE-1)-:TAG_BITS];
@@ -122,165 +122,186 @@ logic MSHR_Broadcast_tag;
 logic [NUM_OF_WAYS-1:0] Eviction_Target_Way; // TODO: Requiring Eviction Policy 
 
 //Store Buffer Signals
-logic [BLOCK_ID_SIZE-1:0] write_block_id_passthrough;
-logic [OFFSET_BITS-1:0] write_offset_passthrough;
-logic write_req_passthrough; 
-logic [XLEN-1:0] write_data_passthrough; 
-logic [3:0] write_byte_en_passthrough;
+logic [BLOCK_ID_SIZE-1:0] store_block_id_passthrough;
+logic [OFFSET_BITS-1:0] store_offset_passthrough;
+logic store_req_passthrough; 
+logic [XLEN-1:0] store_data_passthrough; 
+logic [3:0] store_byte_en_passthrough;
 logic [$clog2(MSHR_SIZE)-1:0] MSHR_ID_passthrough;
 logic Store_Buffer_ID_Alloc;
-assign Store_Buffer_ID_Alloc = MSHR_ID_passthrough;
+assign Store_Buffer_ID_Alloc = MSHR_Alloc_ID;
 
 // Cache logic (load, store, miss)
 always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
     if(!rst_n) begin
-        read_data_out <= 'd0;
-        read_port_stall_out <= 1'b0;
-        write_port_stall_out <= 1'b0;
-        read_data_valid <= 1'b0;
+        load_data_out <= 'd0;
+        load_port_stall_out <= 1'b0;
+        store_port_stall_out <= 1'b0;
+        load_data_valid <= 1'b0;
         L2_block_req_out <= 1'b0;
+        for(int i=0;i<NUM_OF_SETS;i=i+1) begin
+            for(int j=0;j<NUM_OF_WAYS;j=j+1) begin
+                L1Cache_inst[i][j].valid <= 1'b0;
+                L1Cache_inst[i][j].dirty <= 1'b0;
+                L1Cache_inst[i][j].tag <= 'd0;
+                for(int k=0;k<CacheLineSize;k=k+1) begin
+                    L1Cache_inst[i][j].data[k] <= 'd0;
+                end
+            end
+        end
+        for(int i=0;i<MSHR_SIZE;i=i+1) begin
+            MSHR_inst[i].valid <= 1'b0;
+            MSHR_inst[i].block_id <= 'd0;
+            MSHR_inst[i].target_list_ptr <= 'd0;
+            for(int j=0;j<TARGET_LIST_SIZE;j=j+1) begin
+                MSHR_inst[i].target_list[j] <= 'd0;
+            end
+            // To Gemini: can't I just use  MSHR_inst[i]= '{default: 'd0} to reset the whole struct? also for the cache line reset above?
+        end
+        for(int i=0;i<STORE_BUFFER_SIZE;i=i+1) begin
+            Store_Buffer_inst[i].valid <= 1'b0;
+            Store_Buffer_inst[i].block_id <= 'd0;
+            Store_Buffer_inst[i].store_data <= 'd0;
+            Store_Buffer_inst[i].store_byte_en <= 'd0;
+        end
     end
     else begin
-        if(read_req_in) begin
-            L2_block_req_out <= 1'b0;
-            read_port_stall_out <= 1'b0;
-            read_data_valid <= 1'b0;
-            if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
-                for(int i=0;i<NUM_OF_WAYS;i=i+1) begin // traverse each way to find if there is a hit
-                    if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
-                        read_data_out <= L1Cache_inst[extracted_index][i].data;
-                        read_data_valid <= 'd1; // Hit in the L1Cache!
-                        read_port_stall <= 1'b0;
-                        Cache_hit <= 1'b1;
-                        break;
+        if(physical_tag_valid_in) begin
+            if(load_req_in) begin // On req_in, use virtual_index to get the set and wait for (at least) one cycle for the physical tag from the TLB.
+                L2_block_req_out <= 1'b0;
+                load_port_stall_out <= 1'b0;
+                load_data_valid <= 1'b0;
+                if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
+                    for(int i=0;i<NUM_OF_WAYS;i=i+1) begin // traverse each way to find if there is a hit
+                        if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
+                            load_data_out <= L1Cache_inst[extracted_index][i].data;
+                            load_data_valid <= 'd1; // Hit in the L1Cache!
+                            load_port_stall <= 1'b0;
+                            break;
+                        end
+                        
+                        if(i == (NUM_OF_WAYS-1)) begin
+                            // Cache line not found in the set, need to allocate a MSHR
+                            if (MSHR_AVAILABLE) begin
+                                MSHR_inst[MSHR_alloc_ID].block_id <= extracted_block_id;
+                                MSHR_inst[MSHR_alloc_ID].valid <= 1'b1;
+                                MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd1;
+                                MSHR_inst[MSHR_alloc_ID].target_list[0] <= lsq_tag_in;
+                                L2_block_req_out <= 1'b1;
+                                L2_req_block_id_out <= extracted_block_id;
+                            end
+                            else begin
+                                // No MSHR is free, need to stall
+                                load_port_stall <= 1'b1; // assuming lsq handles this approprioately, e.g. holding the same request until stall is de-asserted
+                            end
+                        end
                     end
-                    
-                    if(i == (NUM_OF_WAYS-1)) begin
-                        // Cache line not found in the set, need to allocate a MSHR
-                        if (MSHR_AVAILABLE) begin
-                            MSHR_inst[MSHR_alloc_ID].block_id <= extracted_block_id;
-                            MSHR_inst[MSHR_alloc_ID].valid <= 1'b1;
-                            MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd0;
-                            MSHR_inst[MSHR_alloc_ID].target_list[0] <= lsq_tag_in;
-                            L2_block_req_out <= 1'b1;
-                            L2_req_block_id_out <= extracted_block_id;
-                        end
-                        else begin
-                            // No MSHR is free, need to stall
-                            read_port_stall <= 1'b1; // assuming lsq handles this approprioately, e.g. holding the same request until stall is de-asserted
-                        end
+                end
+                else begin // Found the MSHR waiting for the same tag, add the coming lsq_tag to the target list
+                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr < TARGET_LIST_SIZE) begin
+                        MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr)] <= lsq_tag_in;
+                        MSHR_inst[MSHR_hit_ID].target_list_ptr = MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
+                    end
+                    else begin
+                        //The MSHR's target list is full, so we need to stall the read port
+                        load_port_stall_out <= 1'b1;                
                     end
                 end
             end
-            else begin // Find a MSHR waiting for the same tag, add the coming lsq_tag to the target list
-                if(MSHR_inst[MSHR_hit_ID].target_list_ptr + 1 < TARGET_LIST_SIZE) begin
-                    MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr + 1)] <= lsq_tag_in;
-                    MSHR_inst[MSHR_hit_ID].target_list_ptr = MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
-                end
-                else begin
-                    //The MSHR's target list is full, so we need to stall the read port
-                    read_port_stall_out <= 1'b1;                
-                end
-            end
-        end
-        else if(write_req_in) begin
-            L2_block_req_out <= 1'b0;
-            write_port_stall_out <= 1'b0; 
-            write_req_passthrough <= 1'b0; 
-            if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
-                for(int i=0;i<NUM_OF_WAYS;i=i+1) begin
-                    if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
-                        if(store_byte_en_in[0]) L1Cache_inst[extracted_index][i].data[extracted_offset] <= write_data_in[7:0];
-                        if(store_byte_en_in[1]) L1Cache_inst[extracted_index][i].data[extracted_offset+1] <= write_data_in[15:8];
-                        if(store_byte_en_in[2]) L1Cache_inst[extracted_index][i].data[extracted_offset+2] <= write_data_in[23:16];
-                        if(store_byte_en_in[3]) L1Cache_inst[extracted_index][i].data[extracted_offset+3] <= write_data_in[31:24];
-                        L1Cache_inst[extracted_index][i].dirty <= 'd1;
-                        break;
-                    end
+            else if(store_req_in) begin
+                L2_block_req_out <= 1'b0;
+                store_port_stall_out <= 1'b0; 
+                store_req_passthrough <= 1'b0; 
+                if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
+                    for(int i=0;i<NUM_OF_WAYS;i=i+1) begin
+                        if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
+                            if(store_byte_en_in[0]) L1Cache_inst[extracted_index][i].data[extracted_offset] <= store_data_in[7:0];
+                            if(store_byte_en_in[1]) L1Cache_inst[extracted_index][i].data[extracted_offset+1] <= store_data_in[15:8];
+                            if(store_byte_en_in[2]) L1Cache_inst[extracted_index][i].data[extracted_offset+2] <= store_data_in[23:16];
+                            if(store_byte_en_in[3]) L1Cache_inst[extracted_index][i].data[extracted_offset+3] <= store_data_in[31:24];
+                            L1Cache_inst[extracted_index][i].dirty <= 'd1;
+                            break;
+                        end
 
-                    if(i == (NUM_OF_WAYS-1)) begin
-                        // Cache line not found in the set, need to allocate a MSHR
-                        if (MSHR_AVAILABLE) begin
-                            MSHR_inst[MSHR_alloc_ID].block_id <= {extracted_tag, extracted_index};
-                            MSHR_inst[MSHR_alloc_ID].valid <= 1'b1;
-                            MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd0;
-                            MSHR_inst[MSHR_alloc_ID].target_list[0] <= lsq_tag_in;
-                            L2_block_req_out <= 1'b1;
-                            L2_req_block_id_out <= extracted_block_id;
-                            // need to pass the req to store buffer
-                            write_req_passthrough <= 1'b1;
-                            write_block_id_passthrough <= extracted_block_id;
-                            write_offset_passthrough <= extracted_offset;
-                            write_data_passthrough <= write_data_in;
-                            write_byte_en_passthrough <= store_byte_en_in;
-                            MSHR_ID_passthrough <= MSHR_alloc_ID;
-                        end
-                        else begin
-                            // No MSHR is free, need to stall
-                            write_port_stall_out <= 1'b1;  
-                        end    
-                    end 
-                end        
-            end
-            else begin
-                if(MSHR_inst[MSHR_hit_ID].target_list_ptr + 1 < TARGET_LIST_SIZE) begin
-                    MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr + 1)] <= lsq_tag_in;
-                    MSHR_inst[MSHR_hit_ID].target_list_ptr = MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
-                    write_req_passthrough <= 1'b1;
-                    write_block_id_passthrough <= extracted_block_id;
-                    write_offset_passthrough <= extracted_offset;
-                    write_data_passthrough <= write_data_in;
-                    write_byte_en_passthrough <= store_byte_en_in;
-                    MSHR_ID_passthrough <= MSHR_hit_ID;
+                        if(i == (NUM_OF_WAYS-1)) begin
+                            // Cache line not found in the set, need to allocate a MSHR
+                            if (MSHR_AVAILABLE) begin
+                                MSHR_inst[MSHR_alloc_ID].block_id <= {extracted_tag, extracted_index};
+                                MSHR_inst[MSHR_alloc_ID].valid <= 1'b1;
+                                MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd1;
+                                MSHR_inst[MSHR_alloc_ID].target_list[0] <= lsq_tag_in;
+                                L2_block_req_out <= 1'b1;
+                                L2_req_block_id_out <= extracted_block_id;
+                                Store_Buffer_inst[Store_Buffer_ID_Alloc].valid <= 1'b1;
+                                Store_Buffer_inst[Store_Buffer_ID_Alloc].block_id <= extracted_block_id;   
+                                Store_Buffer_inst[Store_Buffer_ID_Alloc].store_byte_en[extracted_offset +:3] <= Store_Buffer_inst[Store_Buffer_ID_Alloc].store_byte_en[extracted_offset +:3] | store_byte_en_in;         
+                                if(store_byte_en_in[0]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[extracted_offset] <= store_data_in[7:0];
+                                if(store_byte_en_in[1]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[extracted_offset+1] <= store_data_in[15:8];
+                                if(store_byte_en_in[2]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[extracted_offset+2] <= store_data_in[23:16];
+                                if(store_byte_en_in[3]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[extracted_offset+3] <= store_data_in[31:24];
+                            end
+                            else begin
+                                // No MSHR is free, need to stall
+                                store_port_stall_out <= 1'b1;  
+                            end    
+                        end 
+                    end        
                 end
-                else begin
-                    //The MSHR's target list is full, so we need to stall the read (or write port)
-                    read_port_stall_out <= 1'b1;                
-                end 
+                else begin // Found the MSHR waiting for the same tag, add the coming lsq_tag to the target list and pass the store req to store buffer
+                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr < TARGET_LIST_SIZE) begin
+                        MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr)] <= lsq_tag_in;
+                        MSHR_inst[MSHR_hit_ID].target_list_ptr <= MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
+                        Store_Buffer_inst[MSHR_hit_ID].valid <= 1'b1; // MSHR shares the same ID with Store Buffer
+                        Store_Buffer_inst[MSHR_hit_ID].block_id <= extracted_block_id;   
+                        Store_Buffer_inst[MSHR_hit_ID].store_byte_en[extracted_offset +:3] <= Store_Buffer_inst[MSHR_hit_ID].store_byte_en[extracted_offset +:3] | store_byte_en_in;         
+                        if(store_byte_en_in[0]) Store_Buffer_inst[MSHR_hit_ID].store_data[extracted_offset] <= store_data_in[7:0];
+                        if(store_byte_en_in[1]) Store_Buffer_inst[MSHR_hit_ID].store_data[extracted_offset+1] <= store_data_in[15:8];
+                        if(store_byte_en_in[2]) Store_Buffer_inst[MSHR_hit_ID].store_data[extracted_offset+2] <= store_data_in[23:16];
+                        if(store_byte_en_in[3]) Store_Buffer_inst[MSHR_hit_ID].store_data[extracted_offset+3] <= store_data_in[31:24];
+                    end
+                    else begin
+                        //The MSHR's target list is full, so we need to stall the read (or write port)
+                        load_port_stall_out <= 1'b1;                
+                    end 
+                end
             end
         end
-        
-        // Return Block handling: Find a block to replace in the set
-        if(L2_return_block_valid_in) begin
+
+        // Return Block handling
+        if(L2_return_block_valid_in) begin // replace a block in the set
             L1Cache_inst[L2_return_index][Eviction_Target_Way].tag <= L2_return_tag;
             L1Cache_inst[L2_return_index][Eviction_Target_Way].data <= L2_return_block_data_in;
             L1Cache_inst[L2_return_index][Eviction_Target_Way].valid <= 1'b1;
             L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty <= 1'b0;
-            // Find the corresponding MSHR
+            // Find the corresponding MSHR to be retired and return data to the target list
             for(int i=0;i<MSHR_SIZE;i=i+1) begin
-                if(MSHR_inst[i].valid && MSHR_inst[i].block_id == L2_return_block_id_in) begin // find an MSHR waiting for this returned block
-                    // TODO: drain and retire the MSHR and write the store buffer coalesced result
-                    // 1. Write the coalesced data from Store buffer to the Cache line
-                    // 2. Ask LSQ's lsq_tag entries to send request again, since the block has just arrived
-                    // Store_Buffer_Retire <= 1'b1;
-                    // MSHR_Retire <= 1'b1; 
-                    // Retire_id <= i; 
+                if(MSHR_inst[i].valid && MSHR_inst[i].block_id == L2_return_block_id_in) begin // found an MSHR waiting for this returned block (CAM)
+                    // Retire the MSHR & Store Buffer entry
+                    // 1. Retire MSHR: Ask LSQ's lsq_tag entries to send request again, since the block has just arrived and reset the MSHR entry
+                    MSHR_inst[i].valid <= 1'b0;     
+                    for(int j=0;j<TARGET_LIST_SIZE;j=j+1) begin
+                        if(MSHR_inst[i].target_list[j] != 'd0) begin
+                            lsq_wakeup_vector_out[MSHR_inst[i].target_list[j]] <= 1'b1; // wake up the corresponding lsq entry
+                            MSHR_inst[i].target_list[j] <= 'd0; // clear the target list entry after wake up
+                        end
+                        if(j == MSHR_inst[i].target_list_ptr - 1) break;
+                    end
+                    MSHR_inst[i].target_list_ptr <= 'd0;
+                    
+                    // 2. Retire Store Buffer: Write the coalesced data from Store buffer to the Cache line and reset the Store Buffer entry
+                    L1Cache_inst[L2_return_index][Eviction_Target_Way].data <= Store_Buffer_inst[i].store_data;
+                    Store_Buffer_inst[i].valid <= 1'b0;
+                    Store_Buffer_inst[i].store_data <= 'd0;
+                    Store_Buffer_inst[i].store_byte_en <= 'd0;
                     break;
                 end
             end
         end
 
-        // Store Buffer logic
-        // Find an available store buffer (can use MSHR_ID_passthrough = store buffer id for simple allocation) and Coalesce write data and byte_en 
-        if(write_req_passthrough) begin
-            Store_Buffer_inst[Store_Buffer_ID_Alloc].valid <= 1'b1;
-            if(write_byte_en_passthrough[0]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[write_offset_passthrough] <= write_data_passthrough[7:0];
-            if(write_byte_en_passthrough[1]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[write_offset_passthrough+1] <= write_data_passthrough[15:7];
-            if(write_byte_en_passthrough[2]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[write_offset_passthrough+2] <= write_data_passthrough[23:16];
-            if(write_byte_en_passthrough[3]) Store_Buffer_inst[Store_Buffer_ID_Alloc].store_data[write_offset_passthrough+3] <= write_data_passthrough[31:24];
-            Store_Buffer_inst[Store_Buffer_ID_Alloc].block_id <= write_block_id_passthrough;
-            Store_Buffer_inst[Store_Buffer_ID_Alloc].write_byte_en[write_offset_passthrough +:3] <= Store_Buffer_inst[Store_Buffer_ID_Alloc].write_byte_en[write_offset_passthrough +:3] | write_byte_en_passthrough;
-            // ...
-        end
-        /* TODO: write coalesced data to cache line
-        if(Store_Buffer_Retire) begin
-            Store_Buffer_inst[Retire_id].valid <= 1'b0;
-            L1Cache_inst[todo][todo].data <= Store_Buffer_inst[Retire_id].store_data;
-        end
-        */
     end
 
 end
+
 
 // MSHR Allocation logic
 always_comb begin : MSHR_ALLOC

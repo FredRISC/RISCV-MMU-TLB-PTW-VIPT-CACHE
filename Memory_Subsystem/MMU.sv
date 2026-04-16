@@ -19,8 +19,8 @@ input write_req_in,
 
 // Memory Subsystem interface
 output [XLEN-1:0] Physical_Address_out,
-output Physical_Page_ID_valid_out, // PPID found in TLB
-output Physical_Page_ID_Miss_out,  // If true, trigger PTW to fetch mapping
+output Physical_Page_ID_valid_out, // PPN found in TLB; to cache and CPU
+output Physical_Page_ID_Miss_out,  // This can be conneccted to the stall signal of the Cache
 output Dirty_Fault_out,            // If true, trigger PTW to update PTE dirty bit
 
 // Control Registers
@@ -65,7 +65,7 @@ TLB TLB_inst(
     .access_write_in(TLB_access_write_in),
     .Physical_Page_ID_out(TLB_Physical_Page_ID_out),
     .Physical_Page_ID_valid_out(TLB_Physical_Page_ID_valid_out),
-    .Physical_Page_ID_Miss_out(TLB_Physical_Page_ID_Miss_out),
+    .Physical_Page_ID_Miss_out(TLB_Physical_Page_ID_Miss_out), // if this is high, PTW needs to fetch the page table entry from memory and fill the TLB
     .Dirty_Fault_out(TLB_Dirty_Fault_out)
     .fill_en(ptw_fill_en),
     .fill_virtual_page(ptw_fill_virtual_page),
@@ -106,7 +106,7 @@ end
 
 // output assignments
 assign Physical_Address_out = {TLB_Physical_Page_ID_out ,Page_passthrough};
-assign Physical_Page_ID_valid_out = TLB_Physical_Page_ID_valid_out;
+assign Physical_Page_ID_valid_out = TLB_Physical_Page_ID_valid_out; // To CPU (LSQ) so it can release the request and proceed to the next one
 assign Physical_Page_ID_Miss_out = TLB_Physical_Page_ID_Miss_out;
 assign Dirty_Fault_out = TLB_Dirty_Fault_out;
 
