@@ -12,7 +12,7 @@ module TLB(
 //global signals
 input clk,
 input rst_n,
-input flush,
+input flush, // sfence.vma or any other event that requires flushing the TLB
 
 // TLB core signals, from CPU (assuming CPU holds the request until TLB response is ready with Physical_Page_ID_valid_out asserted)
 input [PAGE_ID_WIDTH-1:0] Virtual_Page_ID_in,
@@ -25,7 +25,7 @@ output Physical_Page_ID_valid_out, // to CPU, so CPU can proceed to next request
 output Physical_Page_ID_Miss_out,  // PPN not found in TLB, trigger PTW to fetch the page table entry from memory and fill the TLB
 output Dirty_Fault_out,         // Asserted when a write hits a clean page (needs PTW to set dirty bit in memory)
 
-// TLB Fill Interface (from PTW)
+// PTW-TLB Fill Interface
 input fill_en,
 input [PAGE_ID_WIDTH-1:0] fill_virtual_page,
 input [PAGE_ID_WIDTH-1:0] fill_physical_page,
@@ -55,7 +55,7 @@ always_comb begin
     TLB_Dirty_Fault_index = 'd0; // Default to prevent inferred latch
     if(Virtual_Page_ID_valid_in) begin
         for(int i=0;i < TLB_SIZE;i = i+1) begin
-            if(Virtual_Page_ID_in == TLB_Entries[i].Virtual_Page_ID && TLB_Entries[i].valid) begin
+            if(Virtual_Page_ID_in == TLB_Entries[i].Virtual_Page_ID && TLB_Entries[i].valid) begin // TLB hit
                 if (req_type_in && !TLB_Entries[i].dirty) begin
                     TLB_Dirty_Fault_flag = 1'b1; // Page is present but clean; write requires a fault to update PTE
                     TLB_Dirty_Fault_index = i;

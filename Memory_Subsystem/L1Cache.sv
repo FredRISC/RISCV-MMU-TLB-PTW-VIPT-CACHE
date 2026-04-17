@@ -28,15 +28,16 @@ module L1Cache (
 // global signals
 input clk,
 input rst_n,
-input flush, 
-input TLB_stall_in, // if TLB is not ready with the physical page number, stall the cache access
-input fence_in, // for simplicity, we can assume fence will drain the MSHR and Store buffer and stall new requests until it's done
+input flush,
 
-// Core input signals
+// Core input signals (from CPU, MMU/TLB)
 input [XLEN-1:0] virtual_address_in, // Provides Virtual Index & Offset
 input [TAG_BITS-1:0] physical_tag_in, // From MMU/TLB (arrives at least 1 cycle later)
 input physical_tag_valid_in,          
 input [$clog2(LSQ_SIZE)-1:0] lsq_tag_in, // To be stored in MSHR target list and returned with data for retirement
+
+// CPU output signals (to CPU)
+output TLB_physical_tag_valid_out, // when the tag translation is ready from TLB, can be used as stall signal for LSQ pipeline
 
 // Load interface
 input load_req_in,
@@ -122,14 +123,9 @@ logic MSHR_Broadcast_tag;
 logic [NUM_OF_WAYS-1:0] Eviction_Target_Way; // TODO: Requiring Eviction Policy 
 
 //Store Buffer Signals
-logic [BLOCK_ID_SIZE-1:0] store_block_id_passthrough;
-logic [OFFSET_BITS-1:0] store_offset_passthrough;
 logic store_req_passthrough; 
-logic [XLEN-1:0] store_data_passthrough; 
-logic [3:0] store_byte_en_passthrough;
-logic [$clog2(MSHR_SIZE)-1:0] MSHR_ID_passthrough;
 logic Store_Buffer_ID_Alloc;
-assign Store_Buffer_ID_Alloc = MSHR_Alloc_ID;
+assign Store_Buffer_ID_Alloc = MSHR_alloc_ID;
 
 // Cache logic (load, store, miss)
 always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
@@ -137,32 +133,18 @@ always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
         load_data_out <= 'd0;
         load_port_stall_out <= 1'b0;
         store_port_stall_out <= 1'b0;
-        load_data_valid <= 1'b0;
+        load_data_valid_out <= 1'b0;
         L2_block_req_out <= 1'b0;
         for(int i=0;i<NUM_OF_SETS;i=i+1) begin
             for(int j=0;j<NUM_OF_WAYS;j=j+1) begin
-                L1Cache_inst[i][j].valid <= 1'b0;
-                L1Cache_inst[i][j].dirty <= 1'b0;
-                L1Cache_inst[i][j].tag <= 'd0;
-                for(int k=0;k<CacheLineSize;k=k+1) begin
-                    L1Cache_inst[i][j].data[k] <= 'd0;
-                end
+                L1Cache_inst[i][j] <= '{default: '0};
             end
         end
         for(int i=0;i<MSHR_SIZE;i=i+1) begin
-            MSHR_inst[i].valid <= 1'b0;
-            MSHR_inst[i].block_id <= 'd0;
-            MSHR_inst[i].target_list_ptr <= 'd0;
-            for(int j=0;j<TARGET_LIST_SIZE;j=j+1) begin
-                MSHR_inst[i].target_list[j] <= 'd0;
-            end
-            // To Gemini: can't I just use  MSHR_inst[i]= '{default: 'd0} to reset the whole struct? also for the cache line reset above?
+            MSHR_inst[i] <= '{default: '0};
         end
         for(int i=0;i<STORE_BUFFER_SIZE;i=i+1) begin
-            Store_Buffer_inst[i].valid <= 1'b0;
-            Store_Buffer_inst[i].block_id <= 'd0;
-            Store_Buffer_inst[i].store_data <= 'd0;
-            Store_Buffer_inst[i].store_byte_en <= 'd0;
+            Store_Buffer_inst[i] <= '{default: '0};
         end
     end
     else begin
@@ -170,13 +152,13 @@ always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
             if(load_req_in) begin // On req_in, use virtual_index to get the set and wait for (at least) one cycle for the physical tag from the TLB.
                 L2_block_req_out <= 1'b0;
                 load_port_stall_out <= 1'b0;
-                load_data_valid <= 1'b0;
+                load_data_valid_out <= 1'b0;
                 if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
                     for(int i=0;i<NUM_OF_WAYS;i=i+1) begin // traverse each way to find if there is a hit
                         if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
                             load_data_out <= L1Cache_inst[extracted_index][i].data;
-                            load_data_valid <= 'd1; // Hit in the L1Cache!
-                            load_port_stall <= 1'b0;
+                            load_data_valid_out <= 1'b1; // Hit in the L1Cache!
+                            load_port_stall_out <= 1'b0;
                             break;
                         end
                         
@@ -192,7 +174,7 @@ always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
                             end
                             else begin
                                 // No MSHR is free, need to stall
-                                load_port_stall <= 1'b1; // assuming lsq handles this approprioately, e.g. holding the same request until stall is de-asserted
+                                load_port_stall_out <= 1'b1; // assuming lsq handles this approprioately, e.g. holding the same request until stall is de-asserted
                             end
                         end
                     end
@@ -200,7 +182,7 @@ always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
                 else begin // Found the MSHR waiting for the same tag, add the coming lsq_tag to the target list
                     if(MSHR_inst[MSHR_hit_ID].target_list_ptr < TARGET_LIST_SIZE) begin
                         MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr)] <= lsq_tag_in;
-                        MSHR_inst[MSHR_hit_ID].target_list_ptr = MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
+                        MSHR_inst[MSHR_hit_ID].target_list_ptr <= MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
                     end
                     else begin
                         //The MSHR's target list is full, so we need to stall the read port
@@ -219,7 +201,7 @@ always @(posedge clk || negedge rst_n) begin : CACHE_LOGIC
                             if(store_byte_en_in[1]) L1Cache_inst[extracted_index][i].data[extracted_offset+1] <= store_data_in[15:8];
                             if(store_byte_en_in[2]) L1Cache_inst[extracted_index][i].data[extracted_offset+2] <= store_data_in[23:16];
                             if(store_byte_en_in[3]) L1Cache_inst[extracted_index][i].data[extracted_offset+3] <= store_data_in[31:24];
-                            L1Cache_inst[extracted_index][i].dirty <= 'd1;
+                            L1Cache_inst[extracted_index][i].dirty <= 1'b1;
                             break;
                         end
 
@@ -329,5 +311,6 @@ always_comb begin : MSHR_HIT
     end
 end
 
+assign TLB_physical_tag_valid_out = physical_tag_valid_in; // Directly use the TLB's physical tag valid signal as the stall signal for LSQ pipeline. 
 
 endmodule
