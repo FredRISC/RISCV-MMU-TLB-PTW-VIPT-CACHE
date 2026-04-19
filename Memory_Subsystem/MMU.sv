@@ -1,6 +1,7 @@
 `timescale 1ps/1ps
 
 // This Memory Management Unit (MMU) is responsible for V2P translation by looking up the TLB
+// A Page Table Walker (PTW) is also included to handle TLB miss, Dirty fault, and Page fault
 
 `define XLEN 32
 `define PAGE_WIDTH 12 // 4KB per page
@@ -30,11 +31,11 @@ input write_req_in,
 // Core output interface
 output [TAG_BITS-1:0] physical_tag_out, // The Physical Tag translated by TLB to be passed to the VIPT L1 Cache
 output physical_tag_valid_out, // Valid flag for the output physical tag; to both CPU and L1 Cache
-output Physical_Page_ID_Miss_out,  // debug: TLB miss
-output page_fault_out, // Signals the CPU to take a trap (instruction failed)
+output Physical_Page_ID_Miss_out,  // debug: TLB miss flag from TLB
+output page_fault_out, // Signals the CPU to take a trap (pass control to OS)
 
 // Control Registers
-input [31:0] satp_in,
+input [31:0] satp_in, // RISC-V CSR storing the base address of the L1 PTE frame of a process
 output ptw_busy_out, // debug: PTW is currently walking
 
 // PTW-Memory Interface (Route to L2 Arbiter)
@@ -47,13 +48,14 @@ input [31:0] ptw_mem_read_data_in // The returned L1 PTE, L0 PTE or the translat
 
 );
  
-logic TLB_Virtual_Page_ID_in [PAGE_ID_WIDTH-1:0];
+logic [PAGE_ID_WIDTH-1:0] TLB_Virtual_Page_ID_in;
 logic TLB_Virtual_Page_ID_valid_in;
 logic TLB_req_type_in;
-logic TLB_Physical_Page_ID_out [PAGE_ID_WIDTH-1:0];
+logic [PAGE_ID_WIDTH-1:0] TLB_Physical_Page_ID_out;
 logic TLB_Physical_Page_ID_valid_out;
 logic TLB_Physical_Page_ID_Miss_out;
 logic TLB_Dirty_Fault_out;
+logic TLB_Miss_req_type_in;
 
 // Internal signals connecting PTW and TLB
 logic ptw_fill_en;
@@ -64,6 +66,7 @@ logic ptw_fill_dirty_bit;
 assign TLB_Virtual_Page_ID_in = Virtual_Address_in[(XLEN-1)-:PAGE_ID_WIDTH]; // Get the upper (20) bits of the virtual address as page ID
 assign TLB_Virtual_Page_ID_valid_in = read_req_in | write_req_in;
 assign TLB_req_type_in = write_req_in;
+assign TLB_Miss_req_type_in = write_req_in;
 
 
 TLB TLB_inst(
@@ -88,15 +91,16 @@ PTW PTW_inst(
     .rst_n(rst_n),
     .flush(flush),
     .TLB_Miss_in(TLB_Physical_Page_ID_Miss_out), // core input: Miss flag from TLB 
+    .TLB_Miss_req_type_in(TLB_Miss_req_type_in), // core input: Request type of the TLB miss 
     .Dirty_Fault_in(TLB_Dirty_Fault_out),        // core input: Dirty fault flag from TLB 
     .Virtual_Address_in(Virtual_Address_in),     // core input: virtual address used for PTE offset in L1 and L0 PTE frames
-    .satp_in(satp_in),
+    .satp_in(satp_in),                           // core input: satp CSR that store the the PPN of the Root Page Table
     .fill_en_out(ptw_fill_en),
     .fill_virtual_page_out(ptw_fill_virtual_page),
     .fill_physical_page_out(ptw_fill_physical_page),
     .fill_dirty_bit_out(ptw_fill_dirty_bit),
-    .page_fault_out(page_fault_out),
-    .ptw_busy_out(ptw_busy_out),
+    .page_fault_out(page_fault_out),             
+    .ptw_busy_out(ptw_busy_out),                 // debug: PTW is currently walking; not in IDLE state
     .ptw_mem_req_valid_out(ptw_mem_req_valid_out),
     .ptw_mem_req_type_out(ptw_mem_req_type_out),
     .ptw_mem_addr_out(ptw_mem_addr_out),
@@ -112,3 +116,6 @@ assign physical_tag_valid_out = TLB_Physical_Page_ID_valid_out; // To CPU (LSQ) 
 
 endmodule
 
+/*
+Ensured RISC-V architectural compliance by supporting sfence.vma instructions, implementing hardware flush mechanisms to invalidate the TLB and dynamically abort active Page Table Walks to maintain memory consistency.
+*/

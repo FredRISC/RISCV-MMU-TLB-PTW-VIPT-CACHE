@@ -1,9 +1,8 @@
 `timescale 1ps/1ps
 
-// This is a module implementing L1 cache featuring MSHR (Miss Status Handling Register)
-// This module inputs a memory read or write requests (address, size) and track the MSHRs (store lsq tag into target list, store cacheline tag)
-// and decodes the address into cache line tag, index, and byte offest to check the cache
-// and finally returns data to output
+// This is a module implementing VIPT L1 cache featuring MSHR (Miss Status Handling Register) and Coalescing Store Buffer. 
+// Eviction Policy: This design adopts a mathematichal tree-based PLRU policy with generic number of ways support
+
 
 `define CacheLineSize 64   // 64 bytes per line
 `define L1CacheSize 2**12 // 4KB

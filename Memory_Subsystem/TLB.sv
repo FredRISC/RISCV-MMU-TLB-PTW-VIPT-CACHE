@@ -32,7 +32,7 @@ input [PAGE_ID_WIDTH-1:0] fill_physical_page,
 input fill_dirty_bit // set to 1 if the page is written
 );
 
-
+// TLB entry struct
 typedef struct packed {
     logic [PAGE_ID_WIDTH-1:0] Virtual_Page_ID;
     logic [PAGE_ID_WIDTH-1:0] Physical_Page_ID;
@@ -56,10 +56,11 @@ always_comb begin
     if(Virtual_Page_ID_valid_in) begin
         for(int i=0;i < TLB_SIZE;i = i+1) begin
             if(Virtual_Page_ID_in == TLB_Entries[i].Virtual_Page_ID && TLB_Entries[i].valid) begin // TLB hit
-                if (req_type_in && !TLB_Entries[i].dirty) begin
-                    TLB_Dirty_Fault_flag = 1'b1; // Page is present but clean; write requires a fault to update PTE
+                if (req_type_in && !TLB_Entries[i].dirty) begin // store request comes in, requiring the TLB entry to be dirty
+                    TLB_Dirty_Fault_flag = 1'b1; // if its clean, then raise dirty fault flag for PTW to update the corresponding PTE's dirty bit
                     TLB_Dirty_Fault_index = i;
-                end else begin
+                end 
+                else begin
                     Virtual_Page_ID_Miss_flag = 1'b0;
                     Physical_Page_ID_read = TLB_Entries[i].Physical_Page_ID;
                 end

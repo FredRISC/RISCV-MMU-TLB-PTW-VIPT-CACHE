@@ -22,6 +22,7 @@ module PTW (
 
     // MMU / TLB Interface
     input TLB_Miss_in,
+    input TLB_Miss_req_type_in,
     input Dirty_Fault_in,
     input [31:0] Virtual_Address_in,
     
@@ -34,7 +35,7 @@ module PTW (
     output logic [19:0] fill_physical_page_out,
     output logic fill_dirty_bit_out,
     output logic page_fault_out, // Raised to CPU if V=0 or permission denied
-    output logic ptw_busy_out, // debug: PTW is currently walking
+    output logic ptw_busy_out, // debug: PTW is currently walking; not in IDLE state
 
     // Memory Interface
     output logic ptw_mem_req_valid_out,
@@ -63,6 +64,7 @@ module PTW (
     // Internal registers to hold addresses and PTEs
     logic [31:0] current_va;
     logic is_dirty_fault;
+    logic is_write_req;
     logic [31:0] l1_pte; // PTE read from L1 page table (l1_pte = MEM[satp*4KB+VPN1*4])
     logic [31:0] l0_pte; // PTE read from L0 page table (MEM[l1_pte*4KB + VPN0*4])
     
@@ -82,17 +84,19 @@ module PTW (
         end else begin
             state <= next_state;
             
-            if (state == IDLE && (TLB_Miss_in || Dirty_Fault_in)) begin // In intial IDLE state, detect TLB Miss or Dirty Fault to start the PTW process 
+            // NOTE: WE DON'T NEED THIS IF BLOCK. THIS IS ONLY FOR TRACKING PER PTW REQUEST (TLB MISS or DIRTY FAULT)
+            if (state == IDLE && (TLB_Miss_in || Dirty_Fault_in)) begin
                 current_va <= Virtual_Address_in; // Latch the virtual address for the entire PTW process
                 is_dirty_fault <= Dirty_Fault_in; // Latch the dirty fault signal to determine if we need to set the dirty bit in the PTE later
+                is_write_req <= TLB_Miss_req_type_in; // Latch the write request signal
             end
             
             if (state == WAIT_L1_PTE && ptw_mem_data_valid_in) begin
-                l1_pte <= ptw_mem_read_data_in;
+                l1_pte <= ptw_mem_read_data_in; // Latch the L1 PTE since it is transient
             end
 
             if (state == WAIT_L0_PTE && ptw_mem_data_valid_in) begin
-                l0_pte <= ptw_mem_read_data_in;
+                l0_pte <= ptw_mem_read_data_in; // Latch the L0 PTE since it is transient
             end
         end
     end
@@ -147,9 +151,10 @@ module PTW (
 
             WAIT_L0_PTE: begin
                 if (ptw_mem_data_valid_in) begin
-                    if (!ptw_mem_read_data_in[0]) begin // Check Valid bit (bit 0)
+                    if (!ptw_mem_read_data_in[0]) begin // If the L0 PTE is invalid, then the process is trying to access illegal address
                         next_state = PAGE_FAULT;
-                    end else if (is_dirty_fault || !ptw_mem_read_data_in[7]) begin // PTE[7] is Dirty bit
+                    end 
+                    else if (is_dirty_fault || (!ptw_mem_read_data_in[7] && is_write_req)) begin // PTE[7] is Dirty bit
                         next_state = UPDATE_DIRTY_BIT;
                     end 
                     else begin
@@ -158,7 +163,7 @@ module PTW (
                 end
             end
 
-            UPDATE_DIRTY_BIT: begin
+            UPDATE_DIRTY_BIT: begin // update the dirty bit
                 ptw_mem_req_valid_out = 1'b1;
                 ptw_mem_req_type_out = 1'b1; // the request is a write request if this is 1'b1
                 ptw_mem_addr_out = {l1_pte[29:10], 12'b0} + {20'b0, vpn0, 2'b00};
@@ -177,7 +182,7 @@ module PTW (
                 fill_en_out = 1'b1;
                 fill_virtual_page_out = current_va[31:12];
                 fill_physical_page_out = l0_pte[29:10]; // PPN from L0 PTE
-                fill_dirty_bit_out = is_dirty_fault ? 1'b1 : l0_pte[7];
+                fill_dirty_bit_out = (is_dirty_fault || is_write_req)? 1'b1 : l0_pte[7];
                 next_state = IDLE;
             end
 
