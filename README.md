@@ -1,4 +1,4 @@
-# RISC-V Sv32 Non-Blocking Memory Subsystem
+# Non-Blocking L1 Cache & RISC-V MMU Memory Subsystem
 
 An out-of-order capable memory subsystem prototype written in SystemVerilog. This project implements a Virtually Indexed, Physically Tagged (VIPT) L1 Data Cache (D-Cache), a fully associative Micro-TLB, and a Hardware Page Table Walker (PTW) implementing the core **RISC-V Sv32** Virtual Memory architecture (bypassing permission bits) and a subset of the **Svadu** hardware dirty-bit extension.
 
