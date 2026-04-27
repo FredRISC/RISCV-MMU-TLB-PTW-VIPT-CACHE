@@ -1,7 +1,6 @@
 `timescale 1ps/1ps
 
 // RISC-V Sv32 Hardware Page Table Walker (PTW)
-
 /* 
     RISC-V Sv32 Page Table Entry (PTE) Format (32 bits total):
     | 31...................10 | 9.......8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 |
@@ -10,9 +9,17 @@
     V = Valid (1 if page is in memory, 0 if not allocated or on disk)
     R, W, X = Read, Write, Execute permissions
     U = User mode accessible
-    G = Global mapping
+    G = Global mapping (shared across all processes, ignore ASID of satp and TLB entry)
     A = Accessed (Hardware sets to 1 when read/written)
     D = Dirty (Hardware sets to 1 when written)
+*/
+
+// satp register (32 bits total):
+/* 
+    Note that in standard Sv32, the PPN is 22 bits, supporting 34-bit physical addresses.
+    Sv32 satp register: [31] MODE, [30:22] ASID, [21:0] PPN
+    Note that this implementation only supports 32-bit physical addresses (PABITS=32).
+    The bits [21:20] of the PPN are ignored/hardwired to 0 per implementation 
 */
 
 module PTW (
@@ -53,9 +60,10 @@ module PTW (
         WAIT_L1_PTE,                // REQ_L1_PTE -> WAIT_L1_PTE, after sending memory request for L1 PTE
         REQ_L0_PTE,                 // WAIT_L1_PTE -> REQ_L0_PTE, after receiving L1 PTE and checking its validity
         WAIT_L0_PTE,                // REQ_L0_PTE -> WAIT_L0_PTE, after sending memory request for L0 PTE
-        UPDATE_DIRTY_BIT,           // WAIT_L0_PTE -> UPDATE_DIRTY_BIT, after receiving L0 PTE and if dirty fault is detected
+        SVADU_HANDLING,           // WAIT_L0_PTE -> SVADU_HANDLING, after receiving L0 PTE and if dirty fault is detected
         WAIT_UPDATE,                
         FILL_TLB,
+        WAIT_TLB_FILL,              // FILL_TLB -> WAIT_TLB_FILL, after sending the fill request to TLB; wait for one cycle to let TLB update to prevent repeated PTW miss handling 
         PAGE_FAULT                  // Trap state if PTE is invalid. Waits for pipeline flush.
     } ptw_state_t;
 
@@ -74,6 +82,21 @@ module PTW (
     assign vpn1 = current_va[31:22];
     assign vpn0 = current_va[21:12];
 
+    // Svadu Compliance logic
+    logic [1:0] Svadu_fault_type; // 00: no fault, 01: dirty fault, 10: access fault, 11: both dirty and access fault
+    logic [1:0] Svadu_fault_type_passthrough;
+    always_comb begin
+        Svadu_fault_type = 2'b00; // default to no fault
+        if (ptw_mem_data_valid_in) begin
+            if(!ptw_mem_read_data_in[7] && is_write_req) begin
+                Svadu_fault_type[0] = 1'b1; // dirty fault
+            end
+            if(!ptw_mem_read_data_in[6]) begin
+                Svadu_fault_type[1] = 1'b1; // access fault
+            end
+        end
+    end
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush) begin
             state <= IDLE;
@@ -81,10 +104,12 @@ module PTW (
             is_dirty_fault <= 1'b0;
             l1_pte <= '0;
             l0_pte <= '0;
-        end else begin
+            Svadu_fault_type_passthrough <= 2'b00;
+        end 
+        else begin
             state <= next_state;
+            Svadu_fault_type_passthrough <= Svadu_fault_type; // Pass the fault type since the ptw_mem_data might be transient
             
-            // NOTE: WE DON'T NEED THIS IF BLOCK. THIS IS ONLY FOR TRACKING PER PTW REQUEST (TLB MISS or DIRTY FAULT)
             if (state == IDLE && (TLB_Miss_in || Dirty_Fault_in)) begin
                 current_va <= Virtual_Address_in; // Latch the virtual address for the entire PTW process
                 is_dirty_fault <= Dirty_Fault_in; // Latch the dirty fault signal to determine if we need to set the dirty bit in the PTE later
@@ -126,7 +151,7 @@ module PTW (
 
             REQ_L1_PTE: begin
                 ptw_mem_req_valid_out = 1'b1;
-                // L1 PTE Address = (satp * 4KB) + (VPN1 * 4)
+                // L1 PTE Address = (satp * 4KB) + (VPN1 * 4) (assuming 32-bit physical addressing)
                 ptw_mem_addr_out = {satp_in[19:0], 12'b0} + {20'b0, vpn1, 2'b00}; // Page base address + offset to the PTE within the page
                 next_state = WAIT_L1_PTE;
             end
@@ -154,8 +179,8 @@ module PTW (
                     if (!ptw_mem_read_data_in[0]) begin // If the L0 PTE is invalid, then the process is trying to access illegal address
                         next_state = PAGE_FAULT;
                     end 
-                    else if (is_dirty_fault || (!ptw_mem_read_data_in[7] && is_write_req)) begin // PTE[7] is Dirty bit
-                        next_state = UPDATE_DIRTY_BIT;
+                    else if (Svadu_fault_type != 2'b00) begin // Svadu compliance: Dirty and Access bit checking; PTE[7] is Dirty bit and PTE[6] is Access bit.
+                        next_state = SVADU_HANDLING;
                     end 
                     else begin
                         next_state = FILL_TLB;
@@ -163,16 +188,26 @@ module PTW (
                 end
             end
 
-            UPDATE_DIRTY_BIT: begin // update the dirty bit
+            SVADU_HANDLING: begin // Svadu handling: Updating Dirty or Access bit of the PTE
                 ptw_mem_req_valid_out = 1'b1;
-                ptw_mem_req_type_out = 1'b1; // the request is a write request if this is 1'b1
+                ptw_mem_req_type_out = 1'b1; // this PTW request is a write request
                 ptw_mem_addr_out = {l1_pte[29:10], 12'b0} + {20'b0, vpn0, 2'b00};
-                // Set the Dirty Bit (bit 7) to 1
-                ptw_mem_write_data_out = l0_pte | 32'h0000_0080;
+                case(Svadu_fault_type_passthrough) 
+                    2'b01: begin // Dirty fault only, set bit 7 to 1
+                        ptw_mem_write_data_out = l0_pte | 32'h0000_0080;
+                    end
+                    2'b10: begin // Access fault only, set bit 6 to 1
+                        ptw_mem_write_data_out = l0_pte | 32'h0000_0040;
+                    end
+                    2'b11: begin // Both dirty and access fault, set bits 7 and 6 to 1
+                        ptw_mem_write_data_out = l0_pte | 32'h0000_00C0;
+                    end
+                    default: ptw_mem_write_data_out = l0_pte; // Should not happen, just write back the original PTE without modification
+                endcase
                 next_state = WAIT_UPDATE;
             end
 
-            WAIT_UPDATE: begin // Wait until dirty bit is written to the L0 PTE
+            WAIT_UPDATE: begin // Wait until Svadu handling is done
                 if (ptw_mem_data_valid_in) begin
                     next_state = FILL_TLB;
                 end
@@ -183,6 +218,10 @@ module PTW (
                 fill_virtual_page_out = current_va[31:12];
                 fill_physical_page_out = l0_pte[29:10]; // PPN from L0 PTE
                 fill_dirty_bit_out = (is_dirty_fault || is_write_req)? 1'b1 : l0_pte[7];
+                next_state = WAIT_TLB_FILL;
+            end
+
+            WAIT_TLB_FILL: begin
                 next_state = IDLE;
             end
 

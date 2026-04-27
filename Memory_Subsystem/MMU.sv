@@ -1,41 +1,59 @@
 `timescale 1ps/1ps
 
-// This Memory Management Unit (MMU) is responsible for V2P translation by looking up the TLB
-// A Page Table Walker (PTW) is also included to handle TLB miss, Dirty fault, and Page fault
+// This Memory Management Unit (MMU) containing a TLB and a PTW
+// A Page Table Walker (PTW) is also included to handle TLB miss, Page fault, Svadu extension (HW dirty/access bit management)
+
+// Access fault is not handled in this memory subsystem. 
+// The PMP (Physical Memory Protection) would be implemented later to check permissions before PTW walks the root, leaf PTE, and data frame.
+
+
+// satp register (32 bits total)
+/* 
+    Note that:
+    In standard Sv32, the PPN is 22 bits, supporting 34-bit physical addresses.
+    Sv32 satp register format: [31] MODE, [30:22] ASID, [21:0] PPN
+    However, this implementation only supports 32-bit physical addresses (PABITS=32).
+    Bits [21:20] of the PPN are ignored/hardwired to 0 per implementation.
+    The whole memory subsystem addressing is designed as 32-bit accordingly.
+*/
 
 `define XLEN 32
 `define PAGE_WIDTH 12 // 4KB per page
 `define TLB_SIZE 64
-`define PAGE_ID_WIDTH XLEN-PAGE_WIDTH
+`define PAGE_ID_WIDTH `XLEN-`PAGE_WIDTH
 
 `define CacheLineSize 64   // 64 bytes per line
 `define L1CacheSize 2**12 // 4KB
-`define NUM_OF_LINES L1CacheSize/CacheLineSize //2**6 = 64 cache lines
+`define NUM_OF_LINES `L1CacheSize/`CacheLineSize //2**6 = 64 cache lines
 `define NUM_OF_WAYS 4     // 4-way associative cache
-`define NUM_OF_SETS  L1CacheSize/ (NUM_OF_WAYS*CacheLineSize)
+`define NUM_OF_SETS  `L1CacheSize/ (`NUM_OF_WAYS*`CacheLineSize) // 16 sets
 
-`define INDEX_BITS $clog2(NUM_OF_SETS)
-`define OFFSET_BITS $clog2(CacheLineSize)
-`define TAG_BITS XLEN - INDEX_BITS - OFFSET_BITS
+`define INDEX_BITS $clog2(`NUM_OF_SETS)
+`define OFFSET_BITS $clog2(`CacheLineSize)
+`define TAG_BITS `XLEN - `INDEX_BITS - `OFFSET_BITS // 32-4-6=22
 
 module MMU(
 input clk,
 input rst_n,
 input flush,
+input [31:0] flush_vaddr_in,       // From sfence.vma rs1
+input [8:0] flush_asid_in,         // From sfence.vma rs2
+input flush_vaddr_valid_in,        // 1 if rs1 != x0
+input flush_asid_valid_in,         // 1 if rs2 != x0
 
 // CPU interface
-input [PAGE_ID_WIDTH-1:0] Virtual_Address_in,
-input read_req_in,
-input write_req_in,
+input [`XLEN-1:0] Virtual_Address_in,
+input load_req_in,
+input store_req_in,
 
 // Core output interface
-output [TAG_BITS-1:0] physical_tag_out, // The Physical Tag translated by TLB to be passed to the VIPT L1 Cache
+output [`TAG_BITS-1:0] physical_tag_out, // The Physical Tag translated by TLB to be passed to the VIPT L1 Cache
 output physical_tag_valid_out, // Valid flag for the output physical tag; to both CPU and L1 Cache
 output Physical_Page_ID_Miss_out,  // debug: TLB miss flag from TLB
 output page_fault_out, // Signals the CPU to take a trap (pass control to OS)
 
 // Control Registers
-input [31:0] satp_in, // RISC-V CSR storing the base address of the L1 PTE frame of a process
+input [31:0] satp_in, // RISC-V CSR storing the root PTE frame of a process
 output ptw_busy_out, // debug: PTW is currently walking
 
 // PTW-Memory Interface (Route to L2 Arbiter)
@@ -48,10 +66,10 @@ input [31:0] ptw_mem_read_data_in // The returned L1 PTE, L0 PTE or the translat
 
 );
  
-logic [PAGE_ID_WIDTH-1:0] TLB_Virtual_Page_ID_in;
+logic [`PAGE_ID_WIDTH-1:0] TLB_Virtual_Page_ID_in;
 logic TLB_Virtual_Page_ID_valid_in;
 logic TLB_req_type_in;
-logic [PAGE_ID_WIDTH-1:0] TLB_Physical_Page_ID_out;
+logic [`PAGE_ID_WIDTH-1:0] TLB_Physical_Page_ID_out;
 logic TLB_Physical_Page_ID_valid_out;
 logic TLB_Physical_Page_ID_Miss_out;
 logic TLB_Dirty_Fault_out;
@@ -63,19 +81,24 @@ logic [19:0] ptw_fill_virtual_page;
 logic [19:0] ptw_fill_physical_page;
 logic ptw_fill_dirty_bit;
 
-assign TLB_Virtual_Page_ID_in = Virtual_Address_in[(XLEN-1)-:PAGE_ID_WIDTH]; // Get the upper (20) bits of the virtual address as page ID
-assign TLB_Virtual_Page_ID_valid_in = read_req_in | write_req_in;
-assign TLB_req_type_in = write_req_in;
-assign TLB_Miss_req_type_in = write_req_in;
+assign TLB_Virtual_Page_ID_in = Virtual_Address_in[(`XLEN-1)-:`PAGE_ID_WIDTH]; // Get the upper (20) bits of the virtual address as page ID
+assign TLB_Virtual_Page_ID_valid_in = load_req_in | store_req_in;
+assign TLB_req_type_in = store_req_in;
+assign TLB_Miss_req_type_in = store_req_in;
 
 
 TLB TLB_inst(
     .clk(clk),
     .rst_n(rst_n),
-    .flush(flush), 
+    .flush(flush),
+    .flush_vaddr_in(flush_vaddr_in),
+    .flush_asid_in(flush_asid_in),
+    .flush_vaddr_valid_in(flush_vaddr_valid_in),
+    .flush_asid_valid_in(flush_asid_valid_in), 
     .Virtual_Page_ID_in(TLB_Virtual_Page_ID_in),
     .Virtual_Page_ID_valid_in(TLB_Virtual_Page_ID_valid_in),
     .req_type_in(TLB_req_type_in),
+    .satp_in(satp_in), // for future extension to support ASID
     .Physical_Page_ID_out(TLB_Physical_Page_ID_out),
     .Physical_Page_ID_valid_out(TLB_Physical_Page_ID_valid_out),
     .Physical_Page_ID_Miss_out(TLB_Physical_Page_ID_Miss_out), // if this is high, PTW needs to fetch the page table entry from memory and fill the TLB
@@ -109,13 +132,11 @@ PTW PTW_inst(
     .ptw_mem_read_data_in(ptw_mem_read_data_in)
 );
 
+logic [`XLEN-1:0] physical_address;
+assign physical_address = {TLB_Physical_Page_ID_out, Virtual_Address_in[`PAGE_WIDTH-1:0]};
 
 // output assignments
-assign physical_tag_out = TLB_Physical_Page_ID_out[(PAGE_ID_WIDTH-1)-:TAG_BITS];
+assign physical_tag_out = physical_address[(`XLEN-1)-:`TAG_BITS];
 assign physical_tag_valid_out = TLB_Physical_Page_ID_valid_out; // To CPU (LSQ) so it can release the request and proceed to the next one
 
 endmodule
-
-/*
-Ensured RISC-V architectural compliance by supporting sfence.vma instructions, implementing hardware flush mechanisms to invalidate the TLB and dynamically abort active Page Table Walks to maintain memory consistency.
-*/

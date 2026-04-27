@@ -2,24 +2,35 @@
 
 // This is a module implementing VIPT L1 cache featuring MSHR (Miss Status Handling Register) and Coalescing Store Buffer. 
 // Eviction Policy: This design adopts a mathematichal tree-based PLRU policy with generic number of ways support
+// Inteface with L2 is now simplified
+
+// 32-bit memory addressing is assumed
+/* 
+    Note that:
+    In standard Sv32, the PPN is 22 bits, supporting 34-bit physical addresses.
+    Sv32 satp register format: [31] MODE, [30:22] ASID, [21:0] PPN
+    However, this implementation only supports 32-bit physical addresses (PABITS=32).
+    Bits [21:20] of the PPN are ignored/hardwired to 0 per implementation.
+    The whole memory subsystem addressing is designed accordingly.
+*/
 
 
 `define CacheLineSize 64   // 64 bytes per line
 `define L1CacheSize 2**12 // 4KB
-`define NUM_OF_LINES L1CacheSize/CacheLineSize //2**6 = 64 cache lines
+`define NUM_OF_LINES `L1CacheSize/`CacheLineSize //2**6 = 64 cache lines
 `define NUM_OF_WAYS 4     // 4-way associative cache
-`define NUM_OF_SETS  L1CacheSize/ (NUM_OF_WAYS*CacheLineSize)
+`define NUM_OF_SETS  `L1CacheSize/ (`NUM_OF_WAYS*`CacheLineSize) // 16 sets
 
-`define INDEX_BITS $clog2(NUM_OF_SETS)
-`define OFFSET_BITS $clog2(CacheLineSize)
-`define TAG_BITS XLEN - INDEX_BITS - OFFSET_BITS
+`define INDEX_BITS $clog2(`NUM_OF_SETS)
+`define OFFSET_BITS $clog2(`CacheLineSize)
+`define TAG_BITS `XLEN - `INDEX_BITS - `OFFSET_BITS
 
-`define BLOCK_ID_SIZE TAG_BITS+INDEX_BITS
+`define BLOCK_ID_SIZE `TAG_BITS+`INDEX_BITS
 
 `define MSHR_SIZE 16
 `define TARGET_LIST_SIZE 4
 `define STORE_BUFFER_SIZE 4
-`define PLRU_BITS_SIZE NUM_OF_WAYS-1
+`define PLRU_BITS_SIZE `NUM_OF_WAYS-1
 
 `define XLEN 32 
 `define LSQ_SIZE 16
@@ -31,41 +42,44 @@ input rst_n,
 input flush,
 
 // Core input signals (from CPU, MMU/TLB)
-input [XLEN-1:0] virtual_address_in, // Provides Virtual Index & Offset
-input [TAG_BITS-1:0] physical_tag_in, // From MMU/TLB (arrives at least 1 cycle later)
+input [`XLEN-1:0] virtual_address_in, // Provides Virtual Index & Offset
+input [`TAG_BITS-1:0] physical_tag_in, // From MMU/TLB (arrives at least 1 cycle later)
 input physical_tag_valid_in,          
-input [$clog2(LSQ_SIZE)-1:0] lsq_tag_in, // To be stored in MSHR target list and returned with data for retirement
+input [$clog2(`LSQ_SIZE)-1:0] lsq_tag_in, // To be stored in MSHR target list and returned with data for retirement
 
 // CPU output signals (to CPU)
 output TLB_physical_tag_valid_out, // when the tag translation is ready from TLB, can be used as stall signal for LSQ pipeline
 
 // Load interface
 input load_req_in,
-input load_byte_en_in,
-output load_port_stall_out, // stall
-output [XLEN-1:0] load_data_out,
-output load_data_valid_out,
-output logic [LSQ_SIZE-1:0] lsq_wakeup_vector_out, // wake up the corresponding lsq entry in the same order as target list
+output logic load_port_stall_out, // stall
+output logic [`XLEN-1:0] load_data_out,
+output logic load_data_valid_out,
+output logic [`LSQ_SIZE-1:0] lsq_wakeup_vector_out, // wake up the corresponding lsq entry in the same order as target list
 
 // Store interface
 input store_req_in,
-input [XLEN-1:0] store_data_in,
+input [`XLEN-1:0] store_data_in,
 input [3:0] store_byte_en_in, 
-output store_port_stall_out, // stall
+output logic store_port_stall_out, // stall
 
 // L2 interface 
 // cache block request
-output [BLOCK_ID_SIZE-1:0] L2_req_block_id_out, 
-output L2_block_req_out,
-input [BLOCK_ID_SIZE-1:0] L2_return_block_id_in,
-input [CacheLineSize-1:0] L2_return_block_data_in,
+output [`BLOCK_ID_SIZE-1:0] L2_req_block_id_out, 
+output logic L2_block_req_out,
+// input L2_block_req_ready_in, // Now assuming L2 is always ready (In our advanced design with TileLink this will be replaced)
+
 // cache block return
 input L2_return_block_valid_in,
+input [`BLOCK_ID_SIZE-1:0] L2_return_block_id_in,
+input [`CacheLineSize-1:0][7:0] L2_return_block_data_in,
+// output L2_return_block_ready_out, // Now L1 handle one return block at a time, so always ready (In our advanced design with TileLink this will be replaced)
 
 // cache block eviction
-output L2_evict_block_valid_out, // Write-back dirty lines
-output [BLOCK_ID_SIZE-1:0] L2_evict_block_id_out,
-output [CacheLineSize-1:0][7:0] L2_evict_block_data_out
+output logic L2_evict_block_valid_out, // Write-back dirty lines
+output logic [`BLOCK_ID_SIZE-1:0] L2_evict_block_id_out,
+output logic [`CacheLineSize-1:0][7:0] L2_evict_block_data_out
+// output L2_evict_block_ready_in, // Now assuming L2 is always ready for eviction (In our advanced design with TileLink this will be replaced)
 );
 
 // Cacheline struct
@@ -73,66 +87,65 @@ typedef struct packed {
 // logic [`NUM_OF_STATE:0] state; // Assuming L1 is private; this will be present in L2
 logic valid;
 logic dirty;
-logic [TAG_BITS-1:0] tag;
-logic [CacheLineSize-1:0][7:0] data; // 64 bytes per line
+logic [`TAG_BITS-1:0] tag;
+logic [`CacheLineSize-1:0][7:0] data; // 64 bytes per line
 
 } CacheLine_t;
 
-CacheLine_t [$clog2(NUM_OF_WAYS)-1:0] L1Cache_inst [NUM_OF_SETS-1:0];
+CacheLine_t [$clog2(`NUM_OF_WAYS)-1:0] L1Cache_inst [`NUM_OF_SETS-1:0];
 
 // Decode request address
-logic [TAG_BITS-1:0] extracted_tag;
-logic [INDEX_BITS-1:0] extracted_index;
-logic [OFFSET_BITS-1:0] extracted_offset;
+logic [`TAG_BITS-1:0] extracted_tag;
+logic [`INDEX_BITS-1:0] extracted_index;
+logic [`OFFSET_BITS-1:0] extracted_offset;
 assign extracted_tag = physical_tag_in; // VIPT: Tag comes from Physical Address (TLB)
-assign extracted_index = virtual_address_in[OFFSET_BITS +: INDEX_BITS]; // VIPT: Index from Virtual Addr
-assign extracted_offset = virtual_address_in[0 +: OFFSET_BITS];
+assign extracted_index = virtual_address_in[`OFFSET_BITS +: `INDEX_BITS]; // VIPT: Index from Virtual Addr
+assign extracted_offset = virtual_address_in[0 +: `OFFSET_BITS];
 
-logic [BLOCK_ID_SIZE-1:0] extracted_block_id;
+logic [`BLOCK_ID_SIZE-1:0] extracted_block_id;
 assign extracted_block_id = {extracted_tag, extracted_index};
 
 // MSHR struct
 typedef struct packed {
-    logic valid = 0;
-    logic [BLOCK_ID_SIZE-1:0] block_id; // We need tag and index to match a cache line
-    logic [$clog2(LSQ_SIZE)-1:0] target_list [TARGET_LIST_SIZE-1:0];
-    logic [$clog2(TARGET_LIST_SIZE)-1:0] target_list_ptr = 0; // pointer to the front of the target list
+    logic valid;
+    logic [`BLOCK_ID_SIZE-1:0] block_id; // We need tag and index to match a cache line
+    logic [`TARGET_LIST_SIZE-1:0][$clog2(`LSQ_SIZE)-1:0] target_list;
+    logic [$clog2(`TARGET_LIST_SIZE)-1:0] target_list_ptr; // pointer to the front of the target list
 } MSHR_t;
 
-MSHR_t MSHR_inst [MSHR_SIZE-1:0];
+MSHR_t MSHR_inst [`MSHR_SIZE-1:0];
 
 // Store Buffer struct
 typedef struct packed {
     logic valid;
-    logic [BLOCK_ID_SIZE-1:0] block_id;
-    logic [CacheLineSize-1:0][7:0] store_data; // Coalesced write data
-    logic [CacheLineSize-1:0] store_byte_en; // Coalesced byte enable for the whole cache line
+    logic [`BLOCK_ID_SIZE-1:0] block_id;
+    logic [`CacheLineSize-1:0][7:0] store_data; // Coalesced write data
+    logic [`CacheLineSize-1:0] store_byte_en; // Coalesced byte enable for the whole cache line
 } Store_Buffer_t;
 
-Store_Buffer_t Store_Buffer_inst [MSHR_SIZE-1:0];
+Store_Buffer_t Store_Buffer_inst [`MSHR_SIZE-1:0];
 
 
 // MSHR Signals for Checking on Cacheline Return
 logic MSHR_hit; // find a MSHR waiting for the same cache line
-logic [$clog2(MSHR_SIZE)-1:0] MSHR_hit_ID;
+logic [$clog2(`MSHR_SIZE)-1:0] MSHR_hit_ID;
 // MSHR Signals for Allocation 
-logic [$clog2(MSHR_SIZE)-1:0] MSHR_alloc_ID; // the allocated MSHR ID
+logic [$clog2(`MSHR_SIZE)-1:0] MSHR_alloc_ID; // the allocated MSHR ID
 logic MSHR_AVAILABLE; // no MSHR available
 // L2 Cache Block Return logic
-logic [TAG_BITS-1:0] L2_return_tag;
-logic [INDEX_BITS-1:0] L2_return_index;
-assign L2_return_tag = L2_return_block_id_in[(BLOCK_ID_SIZE-1)-:TAG_BITS];
-assign L2_return_index = L2_return_block_id_in[INDEX_BITS-1:0];
+logic [`TAG_BITS-1:0] L2_return_tag;
+logic [`INDEX_BITS-1:0] L2_return_index;
+assign L2_return_tag = L2_return_block_id_in[(`BLOCK_ID_SIZE-1)-:`TAG_BITS];
+assign L2_return_index = L2_return_block_id_in[`INDEX_BITS-1:0];
 
 // Eviction logic
-logic [$clog2(NUM_OF_WAYS)-1:0] Eviction_Target_Way; // Target way to be evicted, chosen by Tree-based PLRU
-logic [PLRU_BITS_SIZE-1:0] PLRU_bits[NUM_OF_SETS-1:0];
+logic [$clog2(`NUM_OF_WAYS)-1:0] Eviction_Target_Way; // Target way to be evicted, chosen by Tree-based PLRU
+logic [`PLRU_BITS_SIZE-1:0] PLRU_bits[`NUM_OF_SETS-1:0];
 logic Cache_hit;
-logic [$clog2(NUM_OF_WAYS)-1:0] Cache_hit_Way;
-logic [INDEX_BITS-1:0] hit_index; // Latches the index to match the 1-cycle delay of Cache_hit
+logic [$clog2(`NUM_OF_WAYS)-1:0] Cache_hit_Way;
+logic [`INDEX_BITS-1:0] hit_index; // Latches the index to match the 1-cycle delay of Cache_hit
 
 //Store Buffer Signals
-logic store_req_passthrough; 
 logic Store_Buffer_ID_Alloc;
 assign Store_Buffer_ID_Alloc = MSHR_alloc_ID;
 
@@ -142,7 +155,7 @@ assign Collision_Stall = (L2_return_block_valid_in && L2_return_block_id_in == e
 
 // Cache logic (load, store, miss)
 always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
-    if(!rst_n) begin
+    if(!rst_n || flush) begin
         load_data_out <= 'd0;
         load_port_stall_out <= 1'b0;
         store_port_stall_out <= 1'b0;
@@ -152,15 +165,15 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         L2_evict_block_id_out <= '0;
         L2_evict_block_data_out <= '0;
         lsq_wakeup_vector_out <= '0;
-        for(int i=0;i<NUM_OF_SETS;i=i+1) begin
-            for(int j=0;j<NUM_OF_WAYS;j=j+1) begin
+        for(int i=0;i<`NUM_OF_SETS;i=i+1) begin
+            for(int j=0;j<`NUM_OF_WAYS;j=j+1) begin
                 L1Cache_inst[i][j] <= '{default: '0};
             end
         end
-        for(int i=0;i<MSHR_SIZE;i=i+1) begin
+        for(int i=0;i<`MSHR_SIZE;i=i+1) begin
             MSHR_inst[i] <= '{default: '0};
         end
-        for(int i=0;i<STORE_BUFFER_SIZE;i=i+1) begin
+        for(int i=0;i<`STORE_BUFFER_SIZE;i=i+1) begin
             Store_Buffer_inst[i] <= '{default: '0};
         end
         Cache_hit <= 1'b0;
@@ -171,16 +184,16 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         Cache_hit <= 1'b0;
         lsq_wakeup_vector_out <= '0; // Default to 0 to create 1-cycle pulses
         L2_evict_block_valid_out <= 1'b0; // Default to 0
+        L2_block_req_out <= 1'b0; // Default to 0 to create 1-cycle pulses
         if(physical_tag_valid_in) begin
             if(load_req_in) begin // On req_in, use virtual_index to get the set and wait for (at least) one cycle for the physical tag from the TLB.
-                L2_block_req_out <= 1'b0;
                 load_port_stall_out <= 1'b0;
                 load_data_valid_out <= 1'b0;
                 if(Collision_Stall) begin
                     load_port_stall_out <= 1'b1; // Stall for 1 cycle to let L2 fill finish, next cycle will be a clean hit
                 end
                 else if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
-                    for(int i=0;i<NUM_OF_WAYS;i=i+1) begin // Cache hit in the set
+                    for(int i=0;i<`NUM_OF_WAYS;i=i+1) begin // Cache hit in the set
                         if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
                             load_data_out <= L1Cache_inst[extracted_index][i].data;
                             load_data_valid_out <= 1'b1; // Hit in the L1Cache!
@@ -191,7 +204,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                             break;
                         end
                         
-                        if(i == (NUM_OF_WAYS-1)) begin
+                        if(i == (`NUM_OF_WAYS-1)) begin
                             // Cache line not found in the set, need to allocate a MSHR
                             if (MSHR_AVAILABLE) begin
                                 MSHR_inst[MSHR_alloc_ID].block_id <= extracted_block_id;
@@ -209,7 +222,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                     end
                 end
                 else begin // Found the MSHR waiting for the same tag, add the coming lsq_tag to the target list
-                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr < TARGET_LIST_SIZE) begin
+                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr < `TARGET_LIST_SIZE) begin
                         MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr)] <= lsq_tag_in;
                         MSHR_inst[MSHR_hit_ID].target_list_ptr <= MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
                     end
@@ -220,14 +233,12 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                 end
             end
             else if(store_req_in) begin
-                L2_block_req_out <= 1'b0;
                 store_port_stall_out <= 1'b0; 
-                store_req_passthrough <= 1'b0; 
                 if(Collision_Stall) begin
                     store_port_stall_out <= 1'b1; // Stall for 1 cycle to let L2 fill finish, next cycle will be a clean hit
                 end
                 else if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
-                    for(int i=0;i<NUM_OF_WAYS;i=i+1) begin // Cache hit in the set
+                    for(int i=0;i<`NUM_OF_WAYS;i=i+1) begin // Cache hit in the set
                         if(L1Cache_inst[extracted_index][i].valid && L1Cache_inst[extracted_index][i].tag == extracted_tag) begin
                             if(store_byte_en_in[0]) L1Cache_inst[extracted_index][i].data[extracted_offset] <= store_data_in[7:0];
                             if(store_byte_en_in[1]) L1Cache_inst[extracted_index][i].data[extracted_offset+1] <= store_data_in[15:8];
@@ -240,7 +251,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                             break;
                         end
 
-                        if(i == (NUM_OF_WAYS-1)) begin
+                        if(i == (`NUM_OF_WAYS-1)) begin
                             // Cache line not found in the set, need to allocate a MSHR
                             if (MSHR_AVAILABLE) begin
                                 MSHR_inst[MSHR_alloc_ID].block_id <= {extracted_tag, extracted_index};
@@ -294,12 +305,12 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
             L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty <= 1'b0;
             
             // MSHR & Store Buffer Retirement
-            for(int i=0;i<MSHR_SIZE;i=i+1) begin
+            for(int i=0;i<`MSHR_SIZE;i=i+1) begin
                 if(MSHR_inst[i].valid && MSHR_inst[i].block_id == L2_return_block_id_in) begin // found an MSHR waiting for this returned block (CAM)
                    
                     // 1. Retire MSHR: Ask LSQ's lsq_tag entries to send request again, since the block has just arrived and reset the MSHR entry
                     MSHR_inst[i].valid <= 1'b0;     
-                    for(int j=0;j<TARGET_LIST_SIZE;j=j+1) begin
+                    for(int j=0;j<`TARGET_LIST_SIZE;j=j+1) begin
                         if(MSHR_inst[i].target_list[j] != 'd0) begin
                             lsq_wakeup_vector_out[MSHR_inst[i].target_list[j]] <= 1'b1; // wake up the corresponding lsq entry
                             MSHR_inst[i].target_list[j] <= 'd0; // clear the target list entry after wake up
@@ -311,7 +322,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                     // 2. Retire Store Buffer: Merge the coalesced data from Store buffer with the L2 return block
                     // NOTE: Assuming LSQ has dealt with disambiguation, so we can store the data in without concerning the MSHR's loads
                     if(Store_Buffer_inst[i].valid) begin
-                        for(int k=0; k<CacheLineSize; k=k+1) begin
+                        for(int k=0; k<`CacheLineSize; k=k+1) begin
                             if(Store_Buffer_inst[i].store_byte_en[k]) begin
                                 L1Cache_inst[L2_return_index][Eviction_Target_Way].data[k] <= Store_Buffer_inst[i].store_data[k];
                             end
@@ -335,7 +346,7 @@ end
 always_comb begin : MSHR_ALLOC
     MSHR_AVAILABLE = 1'b0;
     MSHR_alloc_ID = 'd0;
-    for (int i=0;i<MSHR_SIZE;i=i+1) begin
+    for (int i=0;i<`MSHR_SIZE;i=i+1) begin
         if(!MSHR_inst[i].valid) begin
             MSHR_alloc_ID = i;
             MSHR_AVAILABLE = 1'b1;
@@ -348,7 +359,7 @@ end
 always_comb begin : MSHR_HIT
     MSHR_hit = 1'b0;
     MSHR_hit_ID = 'd0;
-    for (int i=0;i<MSHR_SIZE;i=i+1) begin
+    for (int i=0;i<`MSHR_SIZE;i=i+1) begin
         if(MSHR_inst[i].valid && MSHR_inst[i].block_id == extracted_block_id) begin
             MSHR_hit = 1'b1;
             MSHR_hit_ID = i;
@@ -376,17 +387,17 @@ end
 
 
 // Record the tree index to be updated; totally depth=$clog2(NUM_OF_WAYS) nodes to be updated
-logic [$clog2(PLRU_BITS_SIZE)-1:0] plru_update_idx[$clog2(NUM_OF_WAYS)-1:0];
-logic [$clog2(PLRU_BITS_SIZE)-1:0] evict_plru_update_idx[$clog2(NUM_OF_WAYS)-1:0];
-// plru_update_idx[i+1] = 2*plru_update_idx[i]+2**Cache_hit_Way[$clog2(NUM_OF_WAYS)-1-i];
+logic [$clog2(`PLRU_BITS_SIZE)-1:0] plru_update_idx[$clog2(`NUM_OF_WAYS)-1:0];
+logic [$clog2(`PLRU_BITS_SIZE)-1:0] evict_plru_update_idx[$clog2(`NUM_OF_WAYS)-1:0];
+// plru_update_idx[i+1] = 2*plru_update_idx[i]+2**Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i];
 always_comb begin
-    for (int i=0;i<$clog2(NUM_OF_WAYS);i=i+1) begin
+    for (int i=0;i<$clog2(`NUM_OF_WAYS);i=i+1) begin
         plru_update_idx[i] = '0;
         evict_plru_update_idx[i] = '0;
     end
-    for(int i=0;i<$clog2(NUM_OF_WAYS)-1;i++) begin
+    for(int i=0;i<$clog2(`NUM_OF_WAYS)-1;i++) begin
         // Generic index tracking for Hit Update
-        if(Cache_hit_Way[$clog2(NUM_OF_WAYS)-1-i]) begin
+        if(Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i]) begin
             plru_update_idx[i+1] = 2*plru_update_idx[i]+2;
         end
         else begin
@@ -394,7 +405,7 @@ always_comb begin
         end
 
         // Generic index tracking for Eviction Update
-        if(Eviction_Target_Way[$clog2(NUM_OF_WAYS)-1-i]) begin
+        if(Eviction_Target_Way[$clog2(`NUM_OF_WAYS)-1-i]) begin
             evict_plru_update_idx[i+1] = 2*evict_plru_update_idx[i]+2;
         end
         else begin
@@ -406,21 +417,21 @@ end
 // Tree-based PLRU
 always_ff @(posedge clk or negedge rst_n) begin : UPDATE_PLRU_TREE
     if(!rst_n) begin
-        for(int i = 0; i < NUM_OF_SETS; i = i + 1) PLRU_bits[i] <= '0;
+        for(int i = 0; i < `NUM_OF_SETS; i = i + 1) PLRU_bits[i] <= '0;
     end else begin
         // Implementation for PLRU eviction logic on Hit
         if(Cache_hit) begin
             // Point the tree AWAY from the accessed way
-            for(int i=0;i<$clog2(NUM_OF_WAYS);i=i+1) begin
-                PLRU_bits[hit_index][plru_update_idx[i]] <= ~Cache_hit_Way[$clog2(NUM_OF_WAYS)-1-i];
+            for(int i=0;i<$clog2(`NUM_OF_WAYS);i=i+1) begin
+                PLRU_bits[hit_index][plru_update_idx[i]] <= ~Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i];
             end
         end
 
         // Implementation for PLRU eviction logic on Cache Fill (Miss Return)
         if(L2_return_block_valid_in) begin
             // Point the tree AWAY from the newly filled way
-            for(int i=0;i<$clog2(NUM_OF_WAYS);i=i+1) begin
-                PLRU_bits[L2_return_index][evict_plru_update_idx[i]] <= ~Eviction_Target_Way[$clog2(NUM_OF_WAYS)-1-i];
+            for(int i=0;i<$clog2(`NUM_OF_WAYS);i=i+1) begin
+                PLRU_bits[L2_return_index][evict_plru_update_idx[i]] <= ~Eviction_Target_Way[$clog2(`NUM_OF_WAYS)-1-i];
             end
         end
     end
@@ -430,10 +441,10 @@ end
 always_comb begin : Eviction_Target
     integer node_idx;
     
-    node_idx = 0; // Start at root node
+    node_idx = '0; // Start at root node
     
     // Traverse down the tree levels (log2 of ways)
-    for (int i = 0; i < $clog2(NUM_OF_WAYS); i = i + 1) begin
+    for (int i = 0; i < $clog2(`NUM_OF_WAYS); i = i + 1) begin
         // If current bit is 0, point to left child (2*idx + 1)
         // If current bit is 1, point to right child (2*idx + 2)
         if (PLRU_bits[L2_return_index][node_idx] == 1'b0)
@@ -444,7 +455,7 @@ always_comb begin : Eviction_Target
     
     // Map the leaf node index back to a Way index (0 to NUM_OF_WAYS-1)
     // The first leaf in a binary tree starts at index (NUM_OF_WAYS - 1)
-    Eviction_Target_Way = node_idx - (NUM_OF_WAYS - 1);
+    Eviction_Target_Way = node_idx - (`NUM_OF_WAYS - 1);
 end
 
 assign TLB_physical_tag_valid_out = physical_tag_valid_in; // Directly use the TLB's physical tag valid signal as the stall signal for LSQ pipeline. 
