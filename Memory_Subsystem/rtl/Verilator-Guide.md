@@ -1,15 +1,15 @@
 # The Anatomy of a Verilator C++ Testbench:
 ### 
-1. Include Headers: 
-    Include verilated.h (core library), verilated_vcd_c.h (for waveform dumping), and VYourModule.h (the transpiled SV module).
-2. Instantiate the DUT: 
-    Create a pointer to the transpiled module: e.g. VL1Cache* dut = new VL1Cache;.
-3. The Clock Loop: 
-    Create a while loop that simulates time. Inside the loop, manually toggle the clock pin (dut->clk = 1; dut->eval(); dut->clk = 0; dut->eval();).
-4. Stimulus & Evaluation: 
-    set posedge clk with dut->clk = 1; dut->eval(); set negedge clk with dut->clk = 0; dut->eval();
-    set input pins (e.g., dut->load_req_in = 1;) right before the rising edge, and read output pins right after.
-    dut->eval(): When changing an input pin (e.g., dut->load_req_in = 1;), nothing actually happens yet. When calling dut->eval(), Verilator runs all of the always_comb blocks. When flipping dut->clk = 1 and call eval(), it executes all the always_ff blocks.
+    1. Include Headers: 
+        Include verilated.h (core library), verilated_vcd_c.h (for waveform dumping), and VYourModule.h (the transpiled SV module).
+    2. Instantiate the DUT: 
+        Create a pointer to the transpiled module: e.g. VL1Cache* dut = new VL1Cache;.
+    3. The Clock Loop: 
+        Create a while loop that simulates time. Inside the loop, manually toggle the clock pin (dut->clk = 1; dut->eval(); dut->clk = 0; dut->eval();).
+    4. Stimulus & Evaluation: 
+        set posedge clk with dut->clk = 1; dut->eval(); set negedge clk with dut->clk = 0; dut->eval();
+        set input pins (e.g., dut->load_req_in = 1;) right before the rising edge, and read output pins right after.
+        dut->eval(): When changing an input pin (e.g., dut->load_req_in = 1;), nothing actually happens yet. When calling dut->eval(), Verilator runs all of the always_comb blocks. When flipping dut->clk = 1 and call eval(), it executes all the always_ff blocks.
 
 
 # Verification Plan:

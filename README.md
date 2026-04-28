@@ -36,7 +36,8 @@ This subsystem is designed to interface with a superscalar Out-of-Order (OoO) CP
 
 ## File Structure
 
-* `MMU.sv` - Top-level Memory Management wrapper and CPU-facing interface.
+* `top.sv` - The top-level wrapper.
+* `MMU.sv` - Memory Management unit containing the TLB and the hardware PTW.
 * `TLB.sv` - 64-entry fully associative Micro-TLB with parallel read/fill ports.
 * `PTW.sv` - FSM-based Hardware Page Table Walker (Sv32 2-level traversal).
 * `L1Cache.sv` - 4KB VIPT Cache with MSHR, Store Buffer, and PLRU eviction.
