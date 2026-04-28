@@ -43,7 +43,6 @@ This subsystem is designed to interface with a superscalar Out-of-Order (OoO) CP
 * `L1Cache.sv` - 4KB VIPT Cache with MSHR, Store Buffer, and PLRU eviction.
 
 ## Future Roadmap / Advanced Design Implementation
-* Create a Verilator C++ Testbench to mock CPU LSQ stimulus and randomized L2 memory delays.
 * **Standardized Interconnects:** Migrate the L2 Memory / Bus interface to utilize standard **AMBA AXI4** or **TileLink-C** valid/ready handshaking protocols, including a bus arbiter to multiplex PTW memory walks and L1 Cache evictions.
 * **VIPT Pipelining Optimization:** Replace the flip-flop based Cache Array with synchronous SRAM macros, pipelining the SRAM index read to execute in parallel with the TLB lookup to optimize the critical path.
 * **Full Privileged Spec Compliance:** 
