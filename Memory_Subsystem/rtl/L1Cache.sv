@@ -222,7 +222,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                     end
                 end
                 else begin // Found the MSHR waiting for the same tag, add the coming lsq_tag to the target list
-                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr < `TARGET_LIST_SIZE) begin
+                    if(MSHR_inst[MSHR_hit_ID].target_list_ptr != (`TARGET_LIST_SIZE - 1)) begin
                         MSHR_inst[MSHR_hit_ID].target_list[(MSHR_inst[MSHR_hit_ID].target_list_ptr)] <= lsq_tag_in;
                         MSHR_inst[MSHR_hit_ID].target_list_ptr <= MSHR_inst[MSHR_hit_ID].target_list_ptr + 1;
                     end
