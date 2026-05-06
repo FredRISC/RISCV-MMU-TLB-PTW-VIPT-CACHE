@@ -256,7 +256,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                             if (MSHR_AVAILABLE) begin
                                 MSHR_inst[MSHR_alloc_ID].block_id <= {extracted_tag, extracted_index};
                                 MSHR_inst[MSHR_alloc_ID].valid <= 1'b1;
-                                //MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd1;
+                                MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd0;
                                 //MSHR_inst[MSHR_alloc_ID].target_list[0] <= lsq_tag_in;
                                 L2_block_req_out <= 1'b1;
                                 L2_req_block_id_out <= extracted_block_id;
